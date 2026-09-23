@@ -1,0 +1,28 @@
+{
+  "model_name": "Random Forest",
+  "f1_macro": 1.0,
+  "trained_at": "2026-04-22 19:22",
+  "dataset": {
+    "source": "real",
+    "rows": 1500
+  },
+  "features": [
+    "Hb",
+    "MCV",
+    "MCH",
+    "MCHC",
+    "RBC",
+    "RDW",
+    "Hematocrit",
+    "Mentzer_Index",
+    "Shine_Lal",
+    "England_Fraser",
+    "RDW_MCV_Ratio",
+    "Hb_RBC_Ratio"
+  ],
+  "classes": [
+    "IDA",
+    "Thalassemia_Trait",
+    "Anemia_of_Chronic_Disease"
+  ]
+}

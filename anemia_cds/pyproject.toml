@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hematoai"
+version = "3.0.0"
+description = "Explainable AI for Microcytic Anemia Classification — Rich Terminal CDS"
+requires-python = ">=3.10"
+readme = "README.md"
+
+# Registers the `hemo` shell command globally after `pip install -e .`
+[project.scripts]
+hemo = "hemo_cli:cli"
+
+[tool.setuptools]
+# Include top-level .py modules AND the modules/ package
+py-modules = ["hemo_cli", "main", "config"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["modules*"]

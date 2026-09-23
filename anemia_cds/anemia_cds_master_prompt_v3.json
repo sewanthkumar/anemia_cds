@@ -1,0 +1,447 @@
+{
+  "project": {
+    "name": "ExplainableAI-MicrocyticAnemia-CDS",
+    "version": "3.0.0",
+    "title": "Explainable AI for Microcytic Anemia Classification — Rich Terminal App",
+    "entry_point": "main.py",
+    "python_version": "3.10+"
+  },
+
+  "architecture_clarification": {
+    "what_runs_locally": [
+      "All ML model training (scikit-learn, XGBoost, LightGBM, Optuna tuning)",
+      "SHAP explanations",
+      "All feature engineering and preprocessing",
+      "The Rich terminal UI",
+      "PDF parsing (PyMuPDF)",
+      "Image OCR (Tesseract + OpenCV)"
+    ],
+    "what_uses_llm_backend": [
+      "Synthetic dataset generation",
+      "CBC value extraction from PDF text",
+      "CBC value extraction from images (vision model)",
+      "EDA narrative explanation",
+      "Per-patient clinical explanation",
+      "Clinical action justification"
+    ],
+    "why_local_training_is_fine": "16GB RAM + decent CPU can train XGBoost + Optuna (50 trials, 5-fold CV) on 1500 rows in under 5 minutes. No GPU needed for tabular CBC data.",
+    "llm_backend_is_swappable": "All LLM calls go through a single LLMClient class in modules/llm_client.py. Switch between Groq and Ollama by changing one setting in config.py or from the Settings menu at runtime."
+  },
+
+  "project_structure": {
+    "root": "anemia_cds/",
+    "files": {
+      "main.py": "Rich terminal app — main menu loop",
+      "config.py": "All constants including LLM_BACKEND setting",
+      ".env": "GROQ_API_KEY and OLLAMA_BASE_URL",
+      "requirements.txt": "All pip dependencies",
+      "modules/": {
+        "llm_client.py": "SINGLE unified LLM interface — Groq or Ollama, swappable at runtime",
+        "data_generator.py": "Synthetic CBC dataset generation via LLM backend",
+        "data_loader.py": "Load and validate real CSV datasets",
+        "report_parser.py": "PDF + image CBC report parser",
+        "preprocessor.py": "Feature engineering, scaling, encoding, SMOTE",
+        "trainer.py": "Local ML training + Optuna tuning",
+        "predictor.py": "Load saved model, run inference",
+        "explainer.py": "SHAP global + local explanations",
+        "clinical_engine.py": "LLM-powered clinical report generation",
+        "ui_components.py": "All Rich panels, tables, banners, menus",
+        "settings_manager.py": "Runtime settings: switch LLM backend, model name, temperature"
+      },
+      "data/": {
+        "synthetic/cbc_synthetic.csv": "Auto-generated training data",
+        "real/": "Drop real CSV datasets here",
+        "active/cbc_active.csv": "Currently active training dataset"
+      },
+      "models/": {
+        "best_model.pkl": "Saved best tuned model",
+        "scaler.pkl": "Fitted StandardScaler",
+        "label_encoder.pkl": "Fitted LabelEncoder",
+        "model_metadata.json": "Model name, F1, training date, dataset info"
+      },
+      "outputs/": {
+        "eda/": "EDA plots",
+        "xai/": "SHAP plots"
+      },
+      "uploads/": "Temp folder for PDF/image inputs"
+    }
+  },
+
+  "llm_client": {
+    "description": "The most important module. ALL LLM calls in the entire project go through this one class. Never call Groq or Ollama directly anywhere else.",
+    "implement_in": "modules/llm_client.py",
+    "class_name": "LLMClient",
+    "full_implementation": {
+      "language": "Python",
+      "code": "
+import os
+import json
+import base64
+import requests
+from groq import Groq
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class LLMClient:
+    \"\"\"
+    Unified LLM interface. Supports Groq (cloud) and Ollama (local).
+    Switch backend by calling set_backend() or changing config.
+    All methods have identical signatures regardless of backend.
+    \"\"\"
+
+    GROQ_TEXT_MODEL   = 'llama-3.3-70b-versatile'
+    GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct'
+    OLLAMA_TEXT_MODEL = 'llama3.2'
+    OLLAMA_VISION_MODEL = 'llava'
+    OLLAMA_BASE_URL   = 'http://localhost:11434'
+
+    def __init__(self, backend: str = 'groq'):
+        \"\"\"
+        backend: 'groq' or 'ollama'
+        \"\"\"
+        self.backend = backend
+        self._groq_client = None
+        self._init_backend()
+
+    def _init_backend(self):
+        if self.backend == 'groq':
+            api_key = os.getenv('GROQ_API_KEY')
+            if not api_key:
+                raise ValueError('GROQ_API_KEY not found in .env file. Get one free at https://console.groq.com')
+            self._groq_client = Groq(api_key=api_key)
+        elif self.backend == 'ollama':
+            self._verify_ollama()
+
+    def _verify_ollama(self):
+        try:
+            r = requests.get(f'{self.OLLAMA_BASE_URL}/api/tags', timeout=3)
+            if r.status_code != 200:
+                raise ConnectionError('Ollama is not running. Start it with: ollama serve')
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError('Ollama not found at localhost:11434. Run: ollama serve')
+
+    def set_backend(self, backend: str, model: str = None):
+        \"\"\"Switch backend at runtime without restarting.\"\"\"
+        self.backend = backend
+        if model:
+            if backend == 'groq':
+                self.GROQ_TEXT_MODEL = model
+            else:
+                self.OLLAMA_TEXT_MODEL = model
+        self._init_backend()
+
+    def chat(self, prompt: str, system: str = None, temperature: float = 0.2, max_tokens: int = 1000) -> str:
+        \"\"\"Send a text prompt. Returns response string. Same API for Groq and Ollama.\"\"\"
+        messages = []
+        if system:
+            messages.append({'role': 'system', 'content': system})
+        messages.append({'role': 'user', 'content': prompt})
+
+        if self.backend == 'groq':
+            response = self._groq_client.chat.completions.create(
+                model=self.GROQ_TEXT_MODEL,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            return response.choices[0].message.content
+
+        elif self.backend == 'ollama':
+            payload = {
+                'model': self.OLLAMA_TEXT_MODEL,
+                'messages': messages,
+                'stream': False,
+                'options': {'temperature': temperature, 'num_predict': max_tokens}
+            }
+            r = requests.post(f'{self.OLLAMA_BASE_URL}/api/chat', json=payload, timeout=120)
+            return r.json()['message']['content']
+
+    def chat_json(self, prompt: str, system: str = None, temperature: float = 0.1) -> dict:
+        \"\"\"Send prompt, parse response as JSON. Strips markdown fences automatically.\"\"\"
+        raw = self.chat(prompt, system=system, temperature=temperature, max_tokens=1000)
+        clean = raw.strip()
+        if clean.startswith('```'):
+            clean = clean.split('```')[1]
+            if clean.startswith('json'):
+                clean = clean[4:]
+        clean = clean.strip().rstrip('`')
+        try:
+            return json.loads(clean)
+        except json.JSONDecodeError:
+            import re
+            match = re.search(r'\\{.*\\}', clean, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+            raise ValueError(f'Could not parse JSON from LLM response: {raw[:200]}')
+
+    def vision(self, image_path: str, prompt: str) -> str:
+        \"\"\"Send image + prompt. Uses vision-capable model. Returns response string.\"\"\"
+        with open(image_path, 'rb') as f:
+            image_data = base64.b64encode(f.read()).decode('utf-8')
+        ext = image_path.lower().split('.')[-1]
+        mime = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png'}.get(ext, 'image/jpeg')
+
+        if self.backend == 'groq':
+            response = self._groq_client.chat.completions.create(
+                model=self.GROQ_VISION_MODEL,
+                messages=[{
+                    'role': 'user',
+                    'content': [
+                        {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{image_data}'}},
+                        {'type': 'text', 'text': prompt}
+                    ]
+                }],
+                max_tokens=500
+            )
+            return response.choices[0].message.content
+
+        elif self.backend == 'ollama':
+            payload = {
+                'model': self.OLLAMA_VISION_MODEL,
+                'prompt': prompt,
+                'images': [image_data],
+                'stream': False
+            }
+            r = requests.post(f'{self.OLLAMA_BASE_URL}/api/generate', json=payload, timeout=120)
+            return r.json()['response']
+
+    def get_status(self) -> dict:
+        \"\"\"Returns current backend info for display in UI status bar.\"\"\"
+        if self.backend == 'groq':
+            return {
+                'backend': 'Groq Cloud ☁',
+                'text_model': self.GROQ_TEXT_MODEL,
+                'vision_model': self.GROQ_VISION_MODEL,
+                'status': 'connected'
+            }
+        else:
+            models_r = requests.get(f'{self.OLLAMA_BASE_URL}/api/tags', timeout=3)
+            installed = [m['name'] for m in models_r.json().get('models', [])]
+            return {
+                'backend': 'Ollama Local 🖥',
+                'text_model': self.OLLAMA_TEXT_MODEL,
+                'vision_model': self.OLLAMA_VISION_MODEL,
+                'installed_models': installed,
+                'status': 'connected'
+            }
+"
+    },
+
+    "usage_in_other_modules": {
+      "pattern": "from modules.llm_client import LLMClient\nclient = LLMClient(backend=config.LLM_BACKEND)\nresponse = client.chat(prompt)\ndata = client.chat_json(prompt)\nresult = client.vision(image_path, prompt)",
+      "rule": "Never import groq or call requests to Ollama directly. Always use LLMClient."
+    }
+  },
+
+  "config": {
+    "implement_in": "config.py",
+    "content": {
+      "LLM_BACKEND": "'groq'  # Change to 'ollama' to switch. Also changeable from Settings menu at runtime.",
+      "FEATURES": ["Hb","MCV","MCH","MCHC","RBC","RDW","Hematocrit","Mentzer_Index","Shine_Lal","England_Fraser","RDW_MCV_Ratio","Hb_RBC_Ratio"],
+      "TARGET_CLASSES": ["IDA","Thalassemia_Trait","Anemia_of_Chronic_Disease"],
+      "BIOLOGIC_RANGES": {
+        "Hb": [3,20], "MCV": [40,130], "MCH": [10,45],
+        "MCHC": [20,40], "RBC": [1.0,8.0], "RDW": [8,30], "Hematocrit": [10,65]
+      },
+      "MODEL_DIR": "models/",
+      "DATA_DIR": "data/",
+      "OUTPUT_DIR": "outputs/",
+      "UPLOAD_DIR": "uploads/",
+      "OPTUNA_TRIALS": 50,
+      "CV_FOLDS": 5,
+      "TEST_SIZE": 0.2,
+      "RANDOM_STATE": 42
+    }
+  },
+
+  "settings_menu": {
+    "description": "Runtime settings panel accessible from main menu. No restart needed when switching backends.",
+    "implement_in": "modules/settings_manager.py",
+    "options": [
+      {
+        "setting": "LLM Backend",
+        "current_value_shown": true,
+        "choices": ["groq", "ollama"],
+        "on_switch_to_ollama": [
+          "Verify Ollama is running (ping localhost:11434)",
+          "List installed Ollama models from /api/tags",
+          "Let user select which model to use for text and vision",
+          "If model not installed: show command 'ollama pull llama3.2' and wait"
+        ],
+        "on_switch_to_groq": [
+          "Verify GROQ_API_KEY exists in .env",
+          "Show which Groq models will be used",
+          "Confirm switch"
+        ]
+      },
+      {
+        "setting": "Groq Text Model",
+        "choices": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+        "note": "Only shown when backend is Groq"
+      },
+      {
+        "setting": "Ollama Text Model",
+        "note": "Dynamically populated from installed models. Only shown when backend is Ollama."
+      },
+      {
+        "setting": "LLM Temperature",
+        "default": 0.2,
+        "range": "0.0 to 1.0",
+        "note": "Lower = more consistent clinical outputs. Keep at 0.2 for medical use."
+      }
+    ],
+    "persistence": "Save current settings to .settings.json so they survive restarts"
+  },
+
+  "ollama_setup_guide": {
+    "description": "Embedded in the app — shown when user selects Ollama for first time",
+    "steps": [
+      {
+        "step": 1,
+        "action": "Install Ollama",
+        "linux_mac": "curl -fsSL https://ollama.com/install.sh | sh",
+        "windows": "Download installer from https://ollama.com/download",
+        "shown_in_terminal": true
+      },
+      {
+        "step": 2,
+        "action": "Start Ollama server",
+        "command": "ollama serve",
+        "note": "Run this in a separate terminal. Keep it running while using HematoAI."
+      },
+      {
+        "step": 3,
+        "action": "Pull recommended models",
+        "text_model": "ollama pull llama3.2",
+        "vision_model": "ollama pull llava",
+        "note": "llama3.2 is 2GB. llava vision model is 4.7GB. Both run fine on 16GB RAM."
+      },
+      {
+        "step": 4,
+        "action": "Switch backend in HematoAI",
+        "how": "Main Menu → Settings → LLM Backend → ollama"
+      }
+    ],
+    "model_size_guide": {
+      "llama3.2":    {"size": "2.0 GB", "ram_needed": "4 GB",  "quality": "Good for clinical text"},
+      "llama3.1:8b": {"size": "4.7 GB", "ram_needed": "8 GB",  "quality": "Better reasoning"},
+      "llava":       {"size": "4.7 GB", "ram_needed": "8 GB",  "quality": "Vision — reads CBC images"},
+      "note": "With 16GB RAM you can run llama3.1:8b + llava simultaneously comfortably."
+    }
+  },
+
+  "training_strategy": {
+    "clarification": "ML training (XGBoost, Random Forest, Optuna) runs entirely locally on your machine. 16GB RAM is more than sufficient. Groq/Ollama is NOT used for training — only for LLM text tasks.",
+    "expected_training_time": {
+      "synthetic_1500_rows": "2-4 minutes with Optuna 50 trials",
+      "real_data_5000_rows": "8-12 minutes with Optuna 50 trials",
+      "note": "XGBoost on tabular data is CPU-efficient. No GPU needed."
+    },
+    "models_trained_locally": [
+      "XGBoost (primary — best for tabular medical data)",
+      "Random Forest (robust baseline)",
+      "LightGBM (fast alternative)",
+      "Logistic Regression (interpretable sanity check)"
+    ],
+    "tuning": {
+      "library": "Optuna",
+      "method": "Bayesian TPE sampler",
+      "trials": 50,
+      "metric": "f1_macro",
+      "cv": "5-fold stratified"
+    }
+  },
+
+  "pipeline": {
+    "all_llm_calls_use": "LLMClient instance from modules/llm_client.py",
+
+    "data_generation": {
+      "prompt": "Generate a realistic synthetic CSV of 1500 microcytic anemia patients. Columns: patient_id,age,gender,Hb,MCV,MCH,MCHC,RBC,RDW,Hematocrit,label. Classes: IDA 60% (RDW high >15, RBC low-normal, MCV 60-79), Thalassemia_Trait 30% (RDW normal <15, RBC high >5.0, MCV very low 60-75), Anemia_of_Chronic_Disease 10% (MCV 72-85, RBC low). Add Gaussian noise. Include 15% borderline overlap. Output ONLY raw CSV starting with header row. No markdown, no explanation.",
+      "method": "client.chat(prompt, max_tokens=8000)"
+    },
+
+    "pdf_cbc_extraction": {
+      "library": "PyMuPDF (fitz)",
+      "extract_text": "text = ' '.join([page.get_text() for page in fitz.open(path)])",
+      "prompt": "Extract CBC values from this lab report text. Return ONLY a JSON object with exactly these keys: Hb, MCV, MCH, MCHC, RBC, RDW, Hematocrit. Use null for missing values. Ignore units. Text: {text}",
+      "method": "client.chat_json(prompt)"
+    },
+
+    "image_cbc_extraction": {
+      "step_1": "Preprocess with OpenCV: grayscale + threshold + denoise",
+      "step_2": "Try Tesseract OCR",
+      "step_3": "If OCR output < 80 chars or contains no numbers: use vision model",
+      "vision_prompt": "This is a medical CBC lab report. Extract these values and return ONLY JSON: {Hb, MCV, MCH, MCHC, RBC, RDW, Hematocrit}. Use null for missing. Numbers only, no units.",
+      "method": "client.vision(image_path, prompt)"
+    },
+
+    "eda_narrative": {
+      "prompt": "Given per-class CBC statistics: {stats_json}. As a hematologist, give 4 bullet points: (1) top discriminating parameters between IDA and Thalassemia Trait, (2) what RDW pattern reveals, (3) what RBC count pattern reveals, (4) dataset quality assessment. Plain language for a GP.",
+      "method": "client.chat(prompt, max_tokens=500)"
+    },
+
+    "clinical_explanation": {
+      "prompt": "Patient CBC: {cbc_values}. ML prediction: {predicted_class} ({confidence:.1f}% confidence). Derived indices: Mentzer={mentzer:.2f} ({'IDA pattern' if mentzer>13 else 'Thalassemia pattern'}), Shine-Lal={shine_lal:.1f}, England-Fraser={ef:.2f}. Top 5 SHAP features: {shap_features}. As a clinical hematologist, in exactly 3 sentences: (1) why this CBC pattern fits this diagnosis, (2) which single parameter is most diagnostic and why, (3) the most critical next step for a rural GP with limited resources. Be direct. No jargon.",
+      "method": "client.chat(prompt, temperature=0.2, max_tokens=350)"
+    }
+  },
+
+  "terminal_ui": {
+    "main_menu_layout": {
+      "header_panel": {
+        "content": [
+          "Line 1: HematoAI v3.0 | Microcytic Anemia CDS",
+          "Line 2: LLM Backend: [green]Groq Cloud ☁[/green] | Model: llama-3.3-70b-versatile",
+          "Line 3: Active Dataset: synthetic (1500 rows) | ML Model: XGBoost | F1: 0.94 | Trained: 2025-04-01"
+        ],
+        "border_style": "bold red"
+      },
+      "menu_options": [
+        "1. Predict from PDF Lab Report",
+        "2. Predict from Image / Photo of Report",
+        "3. Enter CBC Values Manually",
+        "4. Predict Batch from CSV",
+        "5. Run EDA",
+        "6. Train / Retrain Model",
+        "7. Load Real Dataset",
+        "8. View Model Performance",
+        "9. Feature Importance (SHAP)",
+        "S. Settings (Switch Groq ↔ Ollama)",
+        "Q. Quit"
+      ]
+    },
+    "settings_panel_ui": {
+      "show": [
+        "Current backend (highlighted)",
+        "Current models in use",
+        "If Ollama: list of installed models with sizes",
+        "Switch option with confirmation prompt",
+        "If switching to Ollama and not running: show setup commands inline"
+      ]
+    }
+  },
+
+  "how_to_use_this_prompt": {
+    "step_1": "Copy this entire JSON",
+    "step_2": "Open Claude.ai, Cursor, or GPT-4o",
+    "step_3": "Paste with this exact message",
+    "message_to_paste": "You are an expert Python ML engineer. Build this entire project from the JSON spec below. Create every file in the project_structure exactly as described. The most important module is modules/llm_client.py — implement it exactly as specified in the llm_client section including the full Python code. All other modules must use LLMClient for every LLM call. ML training runs locally using scikit-learn/XGBoost/Optuna. The Rich terminal UI in main.py is the only interface. Start by creating config.py, then llm_client.py, then main.py, then all other modules.",
+    "step_4": "Run: pip install -r requirements.txt",
+    "step_5": "Install Tesseract OCR separately: sudo apt install tesseract-ocr (Linux) or download from GitHub for Windows",
+    "step_6": "Add GROQ_API_KEY to .env (get free at console.groq.com)",
+    "step_7": "Run: python main.py",
+    "step_8": "Select 6 to generate synthetic data and train",
+    "step_9": "Test predictions with options 1, 2, or 3",
+    "step_10": "Later: go to Settings (S) to switch to Ollama when ready"
+  },
+
+  "meta": {
+    "version": "3.0",
+    "key_design_principle": "One LLMClient class controls everything. Swapping Groq for Ollama (or back) is a single runtime toggle — no code changes, no restart required.",
+    "training_runs": "locally on your 16GB machine — fast, offline, no API cost",
+    "llm_runs": "on Groq cloud now, Ollama later — both through identical LLMClient interface",
+    "gpu_required": false,
+    "internet_required": "Only when using Groq backend. Ollama mode is fully offline."
+  }
+}
